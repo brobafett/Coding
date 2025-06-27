@@ -20,8 +20,6 @@
 
     Most functions now include an option to export results to a .txt or .csv file on your Desktop.
 
-.AUTHOR
-    Michelle the IT Assistant
 
 .NOTES
     Run this script in a PowerShell console. The menu will guide you through the available options.
