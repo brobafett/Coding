@@ -3,83 +3,259 @@
     A multi-function PowerShell script for performing common network diagnostics and queries.
 
 .DESCRIPTION
-    This script provides a menu-driven interface for various TCP/IP tasks,
-    acting as a consolidated toolkit for network administrators. It combines the
-    functionality of several command-line tools like ipconfig, netstat, nslookup,
-    and tracert into a single, user-friendly PowerShell script.
+    Menu-driven toolkit consolidating ipconfig / netstat / nslookup / tracert style
+    tasks into one script. Compatible with Windows PowerShell 5.1 and PowerShell 7+.
 
-    Inspired by concepts from "TCP/IP Network Administration" and "Windows PowerShell Cookbook".
+    The script is split into two layers:
+      * Data functions  - pure, parameterised, emit objects to the pipeline. No prompts,
+                           no Write-Host, no Format-Table. These are composable and testable:
+                               Test-PortConnectivity -ComputerName host -Port 80,443 | Export-Csv ...
+                               Get-ActiveTcpConnectionInfo | Where-Object RemotePort -eq 443
+      * Interactive layer - thin Invoke-* wrappers that prompt the user, render the data,
+                           and offer an export. The menu only ever calls these.
 
     Features:
-    1. Display Local IP Configuration: Shows detailed IP information for all network adapters.
-    2. Show Active TCP Connections: Lists active connections and their owning processes.
-    3. Port Scanner: Scans a target host for specified open TCP ports.
-    4. Traceroute: Performs a traceroute to a remote host to map the network path.
-    5. DNS Lookup: Resolves a given hostname to its IP address(es).
-    6. Flush DNS Cache: Clears the local DNS resolver cache (Requires Admin).
-
-    Most functions now include an option to export results to a .txt or .csv file on your Desktop.
-
+    1. Display Local IP Configuration
+    2. Show Active TCP Connections (with owning process)
+    3. Port Scanner (lists and ranges, with timeout)
+    4. Traceroute
+    5. DNS Lookup
+    6. Flush DNS Cache (requires Admin)
 
 .NOTES
-    Run this script in a PowerShell console. The menu will guide you through the available options.
-    Some functions require administrative privileges to run correctly. The script will notify you
-    if elevated permissions are needed.
+    Some functions require administrative privileges; the script will tell you when.
 #>
+
+Set-StrictMode -Version 2.0
 
 #region Helper Functions
 
-<#
-.SYNOPSIS
-    Checks if the current PowerShell session is running with Administrator privileges.
-.RETURNS
-    $true if running as Admin, $false otherwise.
-#>
+# Returns $true if the current session is elevated.
 function Test-IsAdmin {
-    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $identity  = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
     return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-<#
-.SYNOPSIS
-    Prompts the user to export data to a file on their desktop.
-.PARAMETER Data
-    The object or collection of objects to export.
-.PARAMETER BaseFileName
-    The base name for the output file (without extension).
-#>
-function Export-Results {
+# Expands a port specification such as "80,443,8000-8010" into a sorted, de-duplicated
+# array of valid (1-65535) integers. Invalid tokens are warned about and skipped.
+function Expand-PortList {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Spec)
+
+    $ports = [System.Collections.Generic.List[int]]::new()
+    foreach ($token in $Spec.Split(',')) {
+        $t = $token.Trim()
+        if ($t -eq '') { continue }
+
+        if ($t -match '^\s*(\d+)\s*-\s*(\d+)\s*$') {
+            $start = [int]$Matches[1]
+            $end   = [int]$Matches[2]
+            if ($start -gt $end) { $start, $end = $end, $start }
+            for ($p = $start; $p -le $end; $p++) { $ports.Add($p) }
+        }
+        elseif ($t -match '^\d+$') {
+            $ports.Add([int]$t)
+        }
+        else {
+            Write-Warning "Ignoring invalid port token: '$t'"
+        }
+    }
+
+    $ports | Where-Object { $_ -ge 1 -and $_ -le 65535 } | Sort-Object -Unique
+}
+
+# Tests a single TCP port with an explicit timeout, using a raw TcpClient so we get
+# fast, controllable results instead of Test-NetConnection's heavyweight probe.
+function Test-TcpPort {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory=$true)]
-        $Data,
-        [Parameter(Mandatory=$true)]
-        [string]$BaseFileName
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][int]$Port,
+        [int]$TimeoutMs = 1000
     )
 
-    $exportChoice = Read-Host "Do you want to export these results? (y/n)"
-    if ($exportChoice -ne 'y') {
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $async = $client.BeginConnect($ComputerName, $Port, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            return $false   # timed out -> treat as closed/filtered
+        }
+        # EndConnect throws if the connection was actively refused.
+        $client.EndConnect($async)
+        return $true
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $client.Close()
+    }
+}
+
+#endregion
+
+#region Data Functions (pure - emit objects, no UI)
+
+# 1. Local IP configuration via CIM (the modern replacement for Get-WmiObject).
+function Get-LocalNetworkInfo {
+    [CmdletBinding()]
+    param()
+
+    $adapters = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration `
+                    -Filter 'IPEnabled = TRUE' -ErrorAction Stop
+    foreach ($adapter in $adapters) {
+        [PSCustomObject]@{
+            Interface      = $adapter.Description
+            IPv4Address    = (@($adapter.IPAddress)           | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' }) -join ', '
+            DefaultGateway = (@($adapter.DefaultIPGateway)     | Where-Object { $_ }) -join ', '
+            DNSServers     = (@($adapter.DNSServerSearchOrder) | Where-Object { $_ }) -join ', '
+        }
+    }
+}
+
+# 2. Established TCP connections with owning process names.
+function Get-ActiveTcpConnectionInfo {
+    [CmdletBinding()]
+    param()
+
+    $connections = Get-NetTCPConnection -State Established -ErrorAction Stop
+    if (-not $connections) { return }
+
+    # Resolve every PID once, not once-per-connection.
+    $processById = @{}
+    foreach ($p in Get-Process -ErrorAction SilentlyContinue) {
+        $processById[$p.Id] = $p.ProcessName
+    }
+
+    foreach ($conn in $connections) {
+        [PSCustomObject]@{
+            ProcessID     = $conn.OwningProcess
+            ProcessName   = if ($processById.ContainsKey([int]$conn.OwningProcess)) { $processById[[int]$conn.OwningProcess] } else { 'N/A' }
+            LocalAddress  = $conn.LocalAddress
+            LocalPort     = $conn.LocalPort
+            RemoteAddress = $conn.RemoteAddress
+            RemotePort    = $conn.RemotePort
+        }
+    }
+}
+
+# 3. Port scanner. Resolves the host once (fail fast on a bad name), then emits one
+#    result object per port. Progress is reported on the Progress stream, not stdout,
+#    so piping the output stays clean.
+function Test-PortConnectivity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][int[]]$Port,
+        [int]$TimeoutMs = 1000
+    )
+
+    try {
+        [System.Net.Dns]::GetHostAddresses($ComputerName) | Out-Null
+    }
+    catch {
+        Write-Error "Host '$ComputerName' could not be resolved."
         return
     }
 
+    $i = 0
+    foreach ($p in $Port) {
+        $i++
+        Write-Progress -Activity "Scanning $ComputerName" -Status "Port $p" `
+            -PercentComplete (($i / $Port.Count) * 100)
+        $isOpen = Test-TcpPort -ComputerName $ComputerName -Port $p -TimeoutMs $TimeoutMs
+        [PSCustomObject]@{
+            Host   = $ComputerName
+            Port   = $p
+            Status = if ($isOpen) { 'Open' } else { 'Closed' }
+        }
+    }
+    Write-Progress -Activity "Scanning $ComputerName" -Completed
+}
+
+# 4. Traceroute. Test-NetConnection's TraceRoute is a string[] of hop addresses, so we
+#    number them ourselves rather than asking for properties that don't exist.
+function Get-TraceRouteHop {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ComputerName)
+
+    $trace = Test-NetConnection -ComputerName $ComputerName -TraceRoute `
+                -WarningAction SilentlyContinue -ErrorAction Stop
+    if (-not $trace.TraceRoute) {
+        Write-Warning "No route information returned (host may be unreachable)."
+        return
+    }
+
+    $hop = 0
+    foreach ($address in $trace.TraceRoute) {
+        [PSCustomObject]@{
+            Hop     = (++$hop)
+            Address = $address      # '0.0.0.0' indicates a hop that did not respond
+        }
+    }
+}
+
+# 5. DNS lookup - thin object-returning wrapper around Resolve-DnsName.
+function Resolve-HostNameRecord {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Name)
+
+    Resolve-DnsName -Name $Name -ErrorAction Stop
+}
+
+# 6. Flush the DNS resolver cache (requires elevation). Throws if not elevated.
+function Clear-DnsResolverCache {
+    [CmdletBinding()]
+    param()
+
+    if (-not (Test-IsAdmin)) {
+        throw "Administrator privileges are required to flush the DNS cache."
+    }
+    Clear-DnsClientCache -ErrorAction Stop
+}
+
+#endregion
+
+#region Presentation Helpers
+
+# Prompts the user to export $Data to the Desktop as text or CSV.
+function Export-Results {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Data,
+        [Parameter(Mandatory)][string]$BaseFileName
+    )
+
+    if (-not $Data) { return }
+
+    $exportChoice = Read-Host "Do you want to export these results? (y/n)"
+    if ($exportChoice -ne 'y') { return }
+
     $formatChoice = Read-Host "Choose export format: [T]ext or [C]SV"
-    $desktopPath = [System.Environment]::GetFolderPath('Desktop')
-    $fileName = "$($BaseFileName)-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-    $fullPath = ""
+    $desktopPath  = [System.Environment]::GetFolderPath('Desktop')
+
+    # Strip characters that are illegal in file names (e.g. ':' from an IPv6 target).
+    $safeBase = $BaseFileName -replace '[\\/:*?"<>|]', '_'
+    $fileName = "$safeBase-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 
     switch -Wildcard ($formatChoice) {
-        "t*" {
-            $fullPath = Join-Path -Path $desktopPath -ChildPath "$($fileName).txt"
-            $Data | Format-Table | Out-File -FilePath $fullPath
+        't*' {
+            $fullPath = Join-Path -Path $desktopPath -ChildPath "$fileName.txt"
+            # Out-String -Width prevents Out-File from truncating wide tables with '...'.
+            $Data | Format-Table -AutoSize | Out-String -Width 4096 | Out-File -FilePath $fullPath -Encoding UTF8
             Write-Host "Results exported to $fullPath" -ForegroundColor Green
         }
-        "c*" {
-            # CSV export requires objects, not formatted text.
-            if ($Data | Get-Member | Where-Object { $_.MemberType -eq 'Property' }) {
-                $fullPath = Join-Path -Path $desktopPath -ChildPath "$($fileName).csv"
-                $Data | Export-Csv -Path $fullPath -NoTypeInformation
+        'c*' {
+            # CSV needs objects with properties. PSCustomObject members are NoteProperty;
+            # real .NET objects expose Property. Accept either.
+            $hasProps = @($Data | Get-Member -MemberType NoteProperty, Property -ErrorAction SilentlyContinue).Count -gt 0
+            if ($hasProps) {
+                $fullPath = Join-Path -Path $desktopPath -ChildPath "$fileName.csv"
+                $Data | Export-Csv -Path $fullPath -NoTypeInformation -Encoding UTF8
                 Write-Host "Results exported to $fullPath" -ForegroundColor Green
-            } else {
+            }
+            else {
                 Write-Warning "CSV export is not supported for this data type. Try Text format."
             }
         }
@@ -89,16 +265,139 @@ function Export-Results {
     }
 }
 
+# Renders a result set as a table and offers to export it. Centralises the
+# display-then-export pattern shared by every interactive wrapper.
+function Show-Result {
+    [CmdletBinding()]
+    param(
+        $Data,
+        [Parameter(Mandatory)][string]$BaseFileName,
+        [string[]]$Property
+    )
+
+    if (-not $Data) {
+        Write-Warning "No results to display."
+        return
+    }
+
+    if ($Property) {
+        $Data | Format-Table -Property $Property -AutoSize
+    }
+    else {
+        $Data | Format-Table -AutoSize
+    }
+
+    Export-Results -Data $Data -BaseFileName $BaseFileName
+}
 
 #endregion
 
-#region Main Menu and Core Logic
+#region Interactive Layer (prompt -> call data function -> display)
 
-# Main loop to display the menu and handle user input
+function Invoke-LocalNetworkInfo {
+    Write-Host "`n[+] Getting Local Network Information..." -ForegroundColor Cyan
+    try {
+        $results = @(Get-LocalNetworkInfo)
+        if (-not $results) { Write-Warning "No IP-enabled network adapters found."; return }
+        Show-Result -Data $results -BaseFileName 'Local-IP-Config'
+    }
+    catch {
+        Write-Error "An error occurred while fetching network information: $_"
+    }
+}
+
+function Invoke-ActiveTcpConnections {
+    Write-Host "`n[+] Getting Active TCP Connections..." -ForegroundColor Cyan
+    try {
+        $results = @(Get-ActiveTcpConnectionInfo)
+        if (-not $results) { Write-Warning "No established TCP connections found."; return }
+        Show-Result -Data $results -BaseFileName 'Active-TCP-Connections'
+    }
+    catch {
+        Write-Error "An error occurred while fetching TCP connections: $_"
+        Write-Warning "Try running PowerShell as an Administrator for complete results."
+    }
+}
+
+function Invoke-PortScan {
+    Write-Host "`n[+] Testing Port Connectivity..." -ForegroundColor Cyan
+    $targetHost = (Read-Host "Enter the target hostname or IP address (e.g., google.com)").Trim()
+    $portSpec   = Read-Host "Enter ports to scan (e.g., 80,443,8000-8010)"
+
+    if (-not $targetHost -or -not $portSpec) {
+        Write-Warning "Host and port numbers are required."
+        return
+    }
+
+    $ports = @(Expand-PortList -Spec $portSpec)
+    if ($ports.Count -eq 0) {
+        Write-Warning "No valid ports to scan."
+        return
+    }
+
+    try {
+        $results = @(Test-PortConnectivity -ComputerName $targetHost -Port $ports -ErrorAction Stop)
+        Show-Result -Data $results -BaseFileName "PortScan-$targetHost"
+    }
+    catch {
+        Write-Host " FAILED ($_)" -ForegroundColor DarkRed
+    }
+}
+
+function Invoke-TraceRoute {
+    Write-Host "`n[+] Performing a Traceroute..." -ForegroundColor Cyan
+    $targetHost = (Read-Host "Enter the destination hostname or IP address").Trim()
+
+    if (-not $targetHost) {
+        Write-Warning "A target host is required."
+        return
+    }
+
+    Write-Host "Tracing route to '$targetHost'... (this can take a while)"
+    try {
+        $results = @(Get-TraceRouteHop -ComputerName $targetHost)
+        Show-Result -Data $results -BaseFileName "Traceroute-To-$targetHost"
+    }
+    catch {
+        Write-Error "An error occurred during the traceroute: $_"
+    }
+}
+
+function Invoke-DnsLookup {
+    Write-Host "`n[+] Performing DNS Lookup..." -ForegroundColor Cyan
+    $hostname = (Read-Host "Enter the hostname to resolve (e.g., www.google.com)").Trim()
+
+    if (-not $hostname) {
+        Write-Warning "A hostname is required."
+        return
+    }
+
+    Write-Host "Resolving '$hostname'..."
+    try {
+        $results = @(Resolve-HostNameRecord -Name $hostname)
+        Show-Result -Data $results -BaseFileName "DNS-Lookup-For-$hostname" -Property Name, Type, IPAddress
+    }
+    catch {
+        Write-Error "Could not resolve the hostname: $_"
+    }
+}
+
+function Invoke-FlushDnsCache {
+    Write-Host "`n[+] Flushing DNS Resolver Cache..." -ForegroundColor Cyan
+    try {
+        Clear-DnsResolverCache
+        Write-Host "Successfully flushed the DNS resolver cache." -ForegroundColor Green
+    }
+    catch {
+        Write-Warning $_.Exception.Message
+    }
+}
+
+#endregion
+
+#region Main Menu
+
 function Show-Menu {
-    param()
-
-    # Infinite loop to keep the menu active until the user chooses to exit.
     while ($true) {
         Write-Host "`n--- PowerShell Network Toolkit ---" -ForegroundColor Yellow
         Write-Host "1: Display Local IP Information"
@@ -110,214 +409,37 @@ function Show-Menu {
         Write-Host "Q: Quit"
         Write-Host "--------------------------------" -ForegroundColor Yellow
 
-        # Prompt the user for their choice.
-        $selection = Read-Host "Please make a selection"
+        $selection = (Read-Host "Please make a selection").Trim()
 
-        # Use a switch statement to execute the function corresponding to the user's choice.
         switch ($selection) {
-            '1' { Get-LocalNetworkInfo }
-            '2' { Get-ActiveTCPConnections }
-            '3' { Test-PortConnectivity }
-            '4' { Trace-RouteToHost }
-            '5' { Resolve-DNSNameInteractive }
-            '6' { Flush-DnsCache }
+            '1' { Invoke-LocalNetworkInfo }
+            '2' { Invoke-ActiveTcpConnections }
+            '3' { Invoke-PortScan }
+            '4' { Invoke-TraceRoute }
+            '5' { Invoke-DnsLookup }
+            '6' { Invoke-FlushDnsCache }
             'Q' {
                 Write-Host "Exiting the toolkit. Goodbye!" -ForegroundColor Green
-                return # Exit the function, which terminates the script.
+                return
             }
             default {
                 Write-Host "Invalid selection. Please try again." -ForegroundColor Red
             }
         }
-        # Pause after a function completes to allow the user to read the output.
-        # The export prompt now serves as this pause, so we only need it for non-exporting functions.
-        if ($selection -in '3','6') {
-            Read-Host "Press Enter to return to the menu..."
+
+        if ($selection -ne 'Q') {
+            # Always pause so warnings/errors are readable before the screen clears.
+            Read-Host "`nPress Enter to return to the menu..." | Out-Null
+            Clear-Host
         }
-        Clear-Host
-    }
-}
-
-#endregion
-
-#region Feature Functions
-
-<#
-.SYNOPSIS
-    Displays detailed IP configuration and provides an option to export.
-#>
-function Get-LocalNetworkInfo {
-    Write-Host "`n[+] Getting Local Network Information (WMI Method)..." -ForegroundColor Cyan
-    try {
-        $adapters = Get-WmiObject -Class Win32_NetworkAdapterConfiguration -Filter "IPEnabled='TRUE'" -ErrorAction Stop
-        if (-not $adapters) {
-            Write-Warning "No IP-enabled network adapters found."
-            return
-        }
-
-        # Create custom objects for clean output and exporting.
-        $results = foreach ($adapter in $adapters) {
-             [PSCustomObject]@{
-                Interface       = $adapter.Description
-                IPv4Address     = ($adapter.IPAddress | Where-Object { $_ -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$' }) -join ', '
-                DefaultGateway  = ($adapter.DefaultIPGateway) -join ', '
-                DNSServers      = ($adapter.DNSServerSearchOrder) -join ', '
-            }
-        }
-        
-        # Display results on screen and then prompt for export.
-        $results | Format-Table -AutoSize
-        Export-Results -Data $results -BaseFileName "Local-IP-Config"
-    }
-    catch {
-        Write-Error "An error occurred while fetching network information via WMI: $_"
-    }
-}
-
-<#
-.SYNOPSIS
-    Lists active TCP connections and provides an option to export.
-#>
-function Get-ActiveTCPConnections {
-    Write-Host "`n[+] Getting Active TCP Connections..." -ForegroundColor Cyan
-    try {
-        $connections = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue
-        if (-not $connections) {
-            Write-Warning "No established TCP connections found."
-            return
-        }
-
-        $results = foreach ($conn in $connections) {
-            $process = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
-            [PSCustomObject]@{
-                ProcessID      = if ($process) { $process.Id } else { $conn.OwningProcess }
-                ProcessName    = if ($process) { $process.ProcessName } else { "N/A" }
-                LocalAddress   = $conn.LocalAddress
-                LocalPort      = $conn.LocalPort
-                RemoteAddress  = $conn.RemoteAddress
-                RemotePort     = $conn.RemotePort
-            }
-        }
-        
-        $results | Format-Table -AutoSize
-        Export-Results -Data $results -BaseFileName "Active-TCP-Connections"
-    }
-    catch {
-        Write-Error "An error occurred while fetching TCP connections: $_"
-        Write-Warning "Try running PowerShell as an Administrator for complete results."
-    }
-}
-
-<#
-.SYNOPSIS
-    Scans a remote host for open TCP ports. (No export option for this function).
-#>
-function Test-PortConnectivity {
-    Write-Host "`n[+] Testing Port Connectivity..." -ForegroundColor Cyan
-    $targetHost = Read-Host "Enter the target hostname or IP address (e.g., google.com)"
-    $ports = Read-Host "Enter ports to scan, separated by commas (e.g., 80,443,8080)"
-
-    if (-not $targetHost -or -not $ports) {
-        Write-Warning "Host and port numbers are required."
-        return
-    }
-
-    $portArray = $ports.Split(',') | ForEach-Object { $_.Trim() }
-    Write-Host "Scanning '$targetHost'..."
-
-    foreach ($port in $portArray) {
-        Write-Host "  - Checking port $port..." -NoNewline
-        try {
-            $result = Test-NetConnection -ComputerName $targetHost -Port $port -WarningAction SilentlyContinue
-            if ($result.TcpTestSucceeded) {
-                Write-Host " OPEN" -ForegroundColor Green
-            }
-            else {
-                Write-Host " CLOSED" -ForegroundColor Red
-            }
-        }
-        catch {
-            Write-Host " FAILED (Host not found or unreachable)" -ForegroundColor DarkRed
-            break
-        }
-    }
-}
-
-<#
-.SYNOPSIS
-    Performs a traceroute and provides an option to export.
-#>
-function Trace-RouteToHost {
-    Write-Host "`n[+] Performing a Traceroute..." -ForegroundColor Cyan
-    $targetHost = Read-Host "Enter the destination hostname or IP address"
-
-    if (-not $targetHost) {
-        Write-Warning "A target host is required."
-        return
-    }
-
-    Write-Host "Tracing route to '$targetHost'..."
-    try {
-        $trace = Test-NetConnection -ComputerName $targetHost -TraceRoute
-        $results = $trace.TraceRoute
-        
-        $results | Format-Table -Property Hop, RoundTripTime, Address, Status -AutoSize
-        Export-Results -Data $results -BaseFileName "Traceroute-To-$($targetHost)"
-    }
-    catch {
-        Write-Error "An error occurred during the traceroute: $_"
-    }
-}
-
-<#
-.SYNOPSIS
-    Resolves a DNS hostname and provides an option to export.
-#>
-function Resolve-DNSNameInteractive {
-    Write-Host "`n[+] Performing DNS Lookup..." -ForegroundColor Cyan
-    $hostname = Read-Host "Enter the hostname to resolve (e.g., www.google.com)"
-
-    if (-not $hostname) {
-        Write-Warning "A hostname is required."
-        return
-    }
-
-    Write-Host "Resolving '$hostname'..."
-    try {
-        $results = Resolve-DnsName -Name $hostname -ErrorAction Stop
-        
-        $results | Format-Table -Property Name, Type, IPAddress -AutoSize
-        Export-Results -Data $results -BaseFileName "DNS-Lookup-For-$($hostname)"
-    }
-    catch {
-        Write-Error "Could not resolve the hostname: $_"
-    }
-}
-
-<#
-.SYNOPSIS
-    Clears the local client-side DNS resolver cache. (No export option for this function).
-#>
-function Flush-DnsCache {
-    Write-Host "`n[+] Flushing DNS Resolver Cache..." -ForegroundColor Cyan
-
-    if (-not (Test-IsAdmin)) {
-        Write-Warning "This action requires Administrator privileges. Please re-run PowerShell as an Administrator."
-        return
-    }
-
-    try {
-        Clear-DnsClientCache -ErrorAction Stop
-        Write-Host "Successfully flushed the DNS resolver cache." -ForegroundColor Green
-    }
-    catch {
-        Write-Error "An error occurred while flushing the DNS cache: $_"
     }
 }
 
 #endregion
 
 # --- Script Entry Point ---
-# Clears the screen and calls the main menu function to start the toolkit.
-Clear-Host
-Show-Menu
+# Only launch the menu when run as a script, not when dot-sourced for testing/composition.
+if ($MyInvocation.InvocationName -ne '.') {
+    Clear-Host
+    Show-Menu
+}
